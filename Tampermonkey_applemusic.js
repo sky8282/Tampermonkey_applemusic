@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Apple Music 下载助手
 // @namespace    http://tampermonkey.net/
-// @version      0.1
+// @version      0.2
 // @author       @sky82813
-// @description  在 Apple Music 官网直接下载音视频 （不能下载 Hi-Res ）
+// @description  在 Apple Music 官网直接下载音视频
 // @match        https://music.apple.com/*
 // @match        https://beta.music.apple.com/*
 // @match        https://classical.music.apple.com/*
@@ -14,8 +14,6 @@
 // @connect      apple.com
 // @connect      itunes.apple.com
 // @connect      mzstatic.com
-// @downloadURL    https://raw.githubusercontent.com/sky8282/Tampermonkey_applemusic/refs/heads/main/Tampermonkey_applemusic.js
-// @updateURL      https://raw.githubusercontent.com/sky8282/Tampermonkey_applemusic/refs/heads/main/Tampermonkey_applemusic.js
 // @connect      *
 // ==/UserScript==
 
@@ -1812,64 +1810,78 @@
                 });
                 const totalDiscs = Math.max(1, ...tracks.map(function(t) { return t.disk_number || t.disc_number || t.discNumber || 1; }));
 
-                for (const [i, trackLight] of tracks.entries()) {
-                    if (isDownloadCancelled) break;
+                let nextTrackIndex = 0;
+                const concurrencyLimit = 3;
 
-                    const discNum = trackLight.disk_number || trackLight.disc_number || trackLight.discNumber || 1;
-                    const reorderedTrackNum = trackDiscIndex[i];
-                    const trackNum = String(reorderedTrackNum).padStart(2, '0');
-                    const cleanName = trackLight.title || trackLight.name || fullItem.fullTitle || ('Track_' + trackNum);
-                    const trackTitle = (tracks.length !== 1 || totalDiscs !== 1) ? (trackNum + '. ' + cleanName) : cleanName;
+                async function trackWorker() {
+                    while (nextTrackIndex < tracks.length) {
+                        if (isDownloadCancelled) break;
+                        const i = nextTrackIndex++;
+                        const trackLight = tracks[i];
 
-                    updateToastProgress({
-                        status: 'running',
-                        albumName: albumTitle,
-                        completedTracks: successCount,
-                        totalTracks: tracks.length,
-                        trackName: trackTitle,
-                        percent: 0
-                    });
+                        const discNum = trackLight.disk_number || trackLight.disc_number || trackLight.discNumber || 1;
+                        const reorderedTrackNum = trackDiscIndex[i];
+                        const trackNum = String(reorderedTrackNum).padStart(2, '0');
+                        const cleanName = trackLight.title || trackLight.name || fullItem.fullTitle || ('Track_' + trackNum);
+                        const trackTitle = (tracks.length !== 1 || totalDiscs !== 1) ? (trackNum + '. ' + cleanName) : cleanName;
 
-                    try {
-                        const queryTarget = trackLight.rawUrl || trackLight.id;
-                        const targetMinRate = quality === 'hires' ? maxAlbumSampleRate : -1;
-                        const trackHeavy = await getAlbumDetails({ id: trackLight.id, rawUrl: queryTarget }, false, targetMinRate, false);
-                        const heavyTrack = trackHeavy.tracks[0];
-                        heavyTrack.disk_number = discNum;
-                        heavyTrack.trackNumber = reorderedTrackNum;
-                        heavyTrack.track_number = reorderedTrackNum;
-                        heavyTrack.totalTracksInDisc = discCounts[discNum];
-                        if (!heavyTrack.coverUrl && fullItem.coverUrl) {
-                            heavyTrack.coverUrl = fullItem.coverUrl;
-                        }
-                        if (quality === 'hires' && heavyTrack.variants) {
-                            heavyTrack.variants.forEach(function(v) {
-                                if (v.sampleRate && Math.max(v.sampleRate, maxAlbumSampleRate) === v.sampleRate) {
-                                    maxAlbumSampleRate = v.sampleRate;
-                                }
-                            });
-                        }
-                        const dlUrl = selectStreamUrl(heavyTrack, quality);
-                        if (!dlUrl) {
-                            console.warn('跳过无流地址曲目:', trackTitle);
-                            continue;
-                        }
+                        updateToastProgress({
+                            status: 'running',
+                            albumName: albumTitle,
+                            completedTracks: successCount,
+                            totalTracks: tracks.length,
+                            trackName: trackTitle,
+                            percent: 0
+                        });
 
-                        await downloadSingleTrackInternal(fullItem, heavyTrack, trackTitle, dlUrl);
-                        if (!isDownloadCancelled) {
-                            successCount++;
-                            updateToastProgress({
-                                status: 'running',
-                                albumName: albumTitle,
-                                completedTracks: successCount,
-                                totalTracks: tracks.length
-                            });
+                        try {
+                            const queryTarget = trackLight.rawUrl || trackLight.id;
+                            const targetMinRate = quality === 'hires' ? maxAlbumSampleRate : -1;
+                            const trackHeavy = await getAlbumDetails({ id: trackLight.id, rawUrl: queryTarget }, false, targetMinRate, false);
+                            const heavyTrack = trackHeavy.tracks[0];
+                            heavyTrack.disk_number = discNum;
+                            heavyTrack.trackNumber = reorderedTrackNum;
+                            heavyTrack.track_number = reorderedTrackNum;
+                            heavyTrack.totalTracksInDisc = discCounts[discNum];
+                            if (!heavyTrack.coverUrl && fullItem.coverUrl) {
+                                heavyTrack.coverUrl = fullItem.coverUrl;
+                            }
+                            if (quality === 'hires' && heavyTrack.variants) {
+                                heavyTrack.variants.forEach(function(v) {
+                                    if (v.sampleRate && Math.max(v.sampleRate, maxAlbumSampleRate) === v.sampleRate) {
+                                        maxAlbumSampleRate = v.sampleRate;
+                                    }
+                                });
+                            }
+                            const dlUrl = selectStreamUrl(heavyTrack, quality);
+                            if (!dlUrl) {
+                                console.warn('跳过无流地址曲目:', trackTitle);
+                                continue;
+                            }
+
+                            await downloadSingleTrackInternal(fullItem, heavyTrack, trackTitle, dlUrl);
+                            if (!isDownloadCancelled) {
+                                successCount++;
+                                updateToastProgress({
+                                    status: 'running',
+                                    albumName: albumTitle,
+                                    completedTracks: successCount,
+                                    totalTracks: tracks.length
+                                });
+                            }
+                        } catch (err) {
+                            console.warn('跳过或单曲下载异常:', trackTitle, err.message || err);
+                            if (isDownloadCancelled) throw err;
                         }
-                    } catch (err) {
-                        console.warn('跳过或单曲下载异常:', trackTitle, err.message || err);
-                        if (isDownloadCancelled) throw err;
                     }
                 }
+
+                const workers = [];
+                const workerCount = Math.min(concurrencyLimit, tracks.length);
+                for (let w = 0; w < workerCount; w++) {
+                    workers.push(trackWorker());
+                }
+                await Promise.all(workers);
 
                 if (isDownloadCancelled) {
                     throw new Error('下载已取消');
@@ -1909,7 +1921,7 @@
 
     const appBridge = {
         download: function(url, details, downloadType, btnEl) {
-            let quality = 'lossless';
+            let quality = 'hires';
             if (downloadType === 'lossless' || downloadType === 'atmos' || downloadType === 'hires') {
                 quality = downloadType;
             }
@@ -1990,21 +2002,21 @@
         'body { padding-bottom: 45px !important; }',
         '.custom-button-container { display: inline-flex; align-items: center; gap: 10px; margin-left: 10px; vertical-align: middle; flex-shrink: 0; }',
         '.custom-dl-btn { border: none !important; border-radius: 50px !important; font-weight: bold !important; cursor: pointer !important; transition: transform 0.2s ease, background-color 0.2s ease !important; line-height: 1.2 !important; display: inline-flex !important; align-items: center; gap: 8px; z-index: 9999; white-space: nowrap; }',
-        '.custom-dl-btn:hover:not(:disabled) { transform: scale(1.05); }',
+        '.custom-dl-btn:hover:not(:disabled) { transform: scale(1.05); background-color: #ffca28 !important; }',
         '.custom-dl-btn:disabled { opacity: 0.5; cursor: not-allowed !important; }',
         '.custom-dl-btn svg { width: 18px; height: 18px; }',
         '.dl-btn-green { background-color: #1DB954 !important; color: black !important; }',
-        '.dl-btn-green:hover:not(:disabled) { background-color: #25d865 !important; }',
+        '.dl-btn-green:hover:not(:disabled) { background-color: #ffca28 !important; }',
         '.dl-btn-green svg { fill: black; }',
-        '.dl-btn-red { background-color: #e74c3c !important; color: white !important; }',
-        '.dl-btn-red:hover:not(:disabled) { background-color: #f95f51 !important; }',
-        '.dl-btn-red svg { fill: white; }',
+        '.dl-btn-red { background-color: #e74c3c !important; color: black !important; }',
+        '.dl-btn-red:hover:not(:disabled) { background-color: #ffca28 !important; }',
+        '.dl-btn-red svg { fill: black; }',
         '.main-dl-btn { padding: 8px 16px !important; font-size: 14px !important; }',
-        '.track-dl-btn { padding: 6px !important; gap: 0 !important; border-radius: 50% !important; margin-left: 0 !important; }',
+        '.track-dl-btn { padding: 6px !important; gap: 0 !important; border-radius: 50% !important; margin-left: -8px !important; margin-right: 8px !important; }',
         '.track-dl-btn svg { width: 16px; height: 16px; margin: 2px; }',
         '.track-dl-btn span { display: none; }',
         '.card-dl-container { opacity: 1 !important; display: flex; justify-content: center; pointer-events: none; padding: 8px; z-index: 99; }',
-        '.card-dl-container .custom-dl-btn { pointer-events: auto !important; padding: 6px !important; gap: 0 !important; border-radius: 50% !important; margin-left: 0 !important; border: 2px solid black !important; }',
+        '.card-dl-container .custom-dl-btn { pointer-events: auto !important; padding: 6px !important; gap: 0 !important; border-radius: 50% !important; margin-left: 0 !important; margin-right: 0 !important; border: 2px solid black !important; }',
         '.card-dl-container .custom-dl-btn svg { width: 16px !important; height: 16px !important; margin: 2px !important; }',
         '.card-dl-container .custom-dl-btn span { display: none !important; }',
         '.ame-track-quality { font-size: 10px; color: var(--systemSecondary); margin-left: 8px; line-height: 1.4; text-align: left; white-space: pre-wrap; font-family: monospace; }',
@@ -2276,7 +2288,7 @@
     const DOWNLOAD_ICON_PATH = 'M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z';
 
     function createButtons(url, details, isSmall, downloadType, customText, colorClass) {
-        const qualityType = downloadType || 'lossless';
+        const qualityType = downloadType || 'hires';
         const label = customText || '下载';
         const themeClass = colorClass || 'dl-btn-green';
         const btnSizeClass = isSmall ? 'track-dl-btn' : 'main-dl-btn';
@@ -2317,9 +2329,11 @@
         const buttonContainer = createEl('div', 'custom-button-container');
         buttonContainer.id = MAIN_BTN_CONTAINER_ID;
 
+        const hiresBtn = createButtons(url, details, false, 'hires', 'Hi-Res', 'dl-btn-green');
         const losslessBtn = createButtons(url, details, false, 'lossless', 'Lossless', 'dl-btn-green');
         const atmosBtn = createButtons(url, details, false, 'atmos', 'Atmos', 'dl-btn-red');
 
+        buttonContainer.appendChild(hiresBtn);
         buttonContainer.appendChild(losslessBtn);
         buttonContainer.appendChild(atmosBtn);
 
@@ -2333,7 +2347,7 @@
         if (!name) return;
         const details = { name: name, artist: name };
         const url = new URL(window.location.href).href;
-        const buttonEl = createButtons(url, details, false, 'lossless', '下载', 'dl-btn-green');
+        const buttonEl = createButtons(url, details, false, 'hires', '下载', 'dl-btn-green');
         const buttonContainer = createEl('div', 'custom-button-container');
         buttonContainer.id = MAIN_BTN_CONTAINER_ID;
         buttonContainer.appendChild(buttonEl);
@@ -2357,7 +2371,7 @@
         const trackName = trackTitleEl ? trackTitleEl.textContent.trim() : '未知曲目';
         const trackArtist = trackArtistEl ? trackArtistEl.textContent.trim() : (headerArtistEl ? headerArtistEl.textContent.trim() : '未知歌手');
         const details = { name: trackName, artist: trackArtist, album: h1El ? h1El.textContent.trim() : '' };
-        const buttonEl = createButtons(url, details, true, 'lossless');
+        const buttonEl = createButtons(url, details, true, 'hires');
         const buttonContainer = createEl('div', 'custom-button-container');
         buttonContainer.appendChild(buttonEl);
         controlsContainer.appendChild(buttonContainer);
@@ -2376,7 +2390,7 @@
         const artistEl = cardRoot.querySelector('div[class*="lockup__subtitle"]');
         if (artistEl) artist = artistEl.textContent.trim();
         const details = { name: name, artist: artist };
-        const buttonEl = createButtons(url, details, true, 'lossless');
+        const buttonEl = createButtons(url, details, true, 'hires');
         const bottomContainer = createEl('div', 'card-dl-container');
         bottomContainer.style.position = 'absolute';
         bottomContainer.style.bottom = '0';
@@ -2415,7 +2429,7 @@
         }
 
         const details = { name: name, artist: artist };
-        const buttonEl = createButtons(url, details, true, 'lossless');
+        const buttonEl = createButtons(url, details, true, 'hires');
         const buttonContainer = createEl('div', 'card-dl-container');
         buttonContainer.style.position = 'absolute';
         buttonContainer.style.bottom = '0';
