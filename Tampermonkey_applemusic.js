@@ -64,7 +64,7 @@
         if (!u || u.startsWith('blob:') || u.startsWith('data:')) return false;
         const resolved = resolveBackendUrl(u);
         if (resolved.startsWith(SERVER_URL)) return true;
-        if (resolved.includes('itunes.apple.com') || resolved.includes('mzstatic.com') || resolved.includes('ak1ra.de5.net')) {
+        if (resolved.includes('ak1ra.de5.net')) {
             return true;
         }
         if (resolved.includes('cdn.jsdelivr.net/npm/') || resolved.includes('unpkg.com/')) {
@@ -82,31 +82,52 @@
         return 'application/octet-stream';
     }
 
+    const staticAssetCache = new Map();
+
     function gmFetchRaw(url, options) {
         const opts = options || {};
         const fullUrl = resolveBackendUrl(url);
-        return new Promise(function(resolve, reject) {
+        const reqMethod = opts.method || 'GET';
+        const respType = opts.responseType || 'text';
+        const cleanPath = fullUrl.split('?')[0].toLowerCase();
+        const isStaticAsset = reqMethod === 'GET' && (cleanPath.endsWith('.wasm') || cleanPath.endsWith('.js') || cleanPath.endsWith('.mjs'));
+        const cacheKey = respType + ':' + fullUrl;
+
+        if (isStaticAsset && staticAssetCache.has(cacheKey)) {
+            return staticAssetCache.get(cacheKey).then(function(cached) {
+                if (cached.response instanceof ArrayBuffer) {
+                    return {
+                        status: cached.status,
+                        response: cached.response.slice(0),
+                        responseText: cached.responseText
+                    };
+                }
+                return cached;
+            });
+        }
+
+        const reqPromise = new Promise(function(resolve, reject) {
             if (!gmXhr) {
                 reject(new Error('油猴未授予 GM_xmlhttpRequest 权限'));
                 return;
             }
             gmXhr({
-                method: opts.method || 'GET',
+                method: reqMethod,
                 url: fullUrl,
                 headers: opts.headers || {},
                 data: opts.body || undefined,
-                responseType: opts.responseType || 'text',
+                responseType: respType,
                 timeout: opts.timeout || 60000,
                 onload: function(resp) {
                     if (resp.status === 404 && fullUrl.startsWith(SERVER_URL + '/assets/') && !fullUrl.startsWith(SERVER_URL + '/assets/mv/')) {
                         const fileName = fullUrl.slice((SERVER_URL + '/assets/').length);
                         const mvAltUrl = SERVER_URL + '/assets/mv/' + fileName;
                         gmXhr({
-                            method: opts.method || 'GET',
+                            method: reqMethod,
                             url: mvAltUrl,
                             headers: opts.headers || {},
                             data: opts.body || undefined,
-                            responseType: opts.responseType || 'text',
+                            responseType: respType,
                             timeout: opts.timeout || 60000,
                             onload: resolve,
                             onerror: function() { resolve(resp); },
@@ -124,6 +145,27 @@
                 }
             });
         });
+
+        if (isStaticAsset) {
+            const cachedPromise = reqPromise.then(function(resp) {
+                if (resp.status === 200) {
+                    return {
+                        status: resp.status,
+                        response: (resp.response instanceof ArrayBuffer) ? resp.response.slice(0) : resp.response,
+                        responseText: (respType === 'text' || !respType) ? resp.responseText : undefined
+                    };
+                }
+                staticAssetCache.delete(cacheKey);
+                return resp;
+            }).catch(function(err) {
+                staticAssetCache.delete(cacheKey);
+                throw err;
+            });
+            staticAssetCache.set(cacheKey, cachedPromise);
+            return gmFetchRaw(url, options);
+        }
+
+        return reqPromise;
     }
 
     async function gmFetchJson(url) {
@@ -756,7 +798,8 @@
                 });
             } catch (e) {}
 
-            const runScript = new Function('window', 'self', 'globalThis', resp.responseText);
+            const fastDecryptCode = resp.responseText.replace('function opfsSupported() {', 'function opfsSupported() { return false;');
+            const runScript = new Function('window', 'self', 'globalThis', fastDecryptCode);
             runScript(pageWindow, pageWindow, pageWindow);
             if (!window.AmDecrypt && pageWindow.AmDecrypt) {
                 window.AmDecrypt = pageWindow.AmDecrypt;
@@ -1321,8 +1364,12 @@
             return cachedCoverPromise;
         }
         cachedCoverUrl = hdUrl;
-        cachedCoverPromise = gmFetchRaw(hdUrl, { responseType: 'arraybuffer' })
-            .then(function(r) { return (r.status === 200 && r.response) ? r.response : null; })
+        cachedCoverPromise = pageWindow.fetch(hdUrl)
+            .then(function(r) { return r.ok ? r.arrayBuffer() : null; })
+            .catch(function() {
+                return gmFetchRaw(hdUrl, { responseType: 'arraybuffer' })
+                    .then(function(r) { return (r.status === 200 && r.response) ? r.response : null; });
+            })
             .catch(function() {
                 cachedCoverPromise = null;
                 return null;
