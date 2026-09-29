@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Apple Music 下载助手
 // @namespace    http://tampermonkey.net/
-// @version      0.2
+// @version      0.3
 // @author       @sky82813
 // @description  在 Apple Music 官网直接下载音视频
 // @match        https://music.apple.com/*
@@ -1201,7 +1201,8 @@
     async function getAlbumDetails(item, lightweight, minRate, forceM3u8) {
         const sf = getStorefront();
         const lwParam = lightweight ? '1' : '0';
-        const rateParam = (minRate && minRate !== 0) ? ('&min_rate=' + minRate) : '';
+        const parsedRate = Number(minRate);
+        const rateParam = (!isNaN(parsedRate) && parsedRate !== 0) ? ('&min_rate=' + parsedRate) : '';
         const m3u8Param = forceM3u8 ? '&check_m3u8=1' : '';
         const reqUrl = '/api/parse?q=' + encodeURIComponent(item.rawUrl || item.id) + '&lightweight=' + lwParam + '&sf=' + encodeURIComponent(sf) + rateParam + m3u8Param;
         const data = await gmFetchJson(reqUrl);
@@ -1310,12 +1311,31 @@
         pageWindow.__am_click_hook_installed = true;
     }
 
-    async function downloadSingleTrackInternal(item, trackData, trackTitle, dlUrl) {
+    let cachedCoverUrl = '';
+    let cachedCoverPromise = null;
+
+    function fetchCoverBuffer(url) {
+        if (!url) return Promise.resolve(null);
+        const hdUrl = url.replace(/\d+x\d+/, '2000x2000');
+        if (cachedCoverUrl === hdUrl && cachedCoverPromise) {
+            return cachedCoverPromise;
+        }
+        cachedCoverUrl = hdUrl;
+        cachedCoverPromise = gmFetchRaw(hdUrl, { responseType: 'arraybuffer' })
+            .then(function(r) { return (r.status === 200 && r.response) ? r.response : null; })
+            .catch(function() {
+                cachedCoverPromise = null;
+                return null;
+            });
+        return cachedCoverPromise;
+    }
+
+    async function downloadSingleTrackInternal(item, trackData, trackTitle, dlUrl, preloadedTrack, onDownloadActive) {
         await ensureAmDecryptLoaded();
         installBlobClickHook();
 
         const rawTitle = trackTitle || item.fullTitle || item.title || item.name || 'Apple_Music_Track';
-        const safeName = String(rawTitle).replace(/[\\/:*?"<>|\r\n]+/g, '_').trim() || 'Apple_Music_Track';
+        const safeName = String(rawTitle).replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().replace(/[\s.]+$/g, '') || 'Apple_Music_Track';
         const isVideo = dlUrl.includes('/api/mv_info') || dlUrl.includes('/proxy_seg') || item.type === 'video' || item.type === 'music-video';
         const ext = isVideo ? '.mp4' : '.m4a';
         const finalFileName = safeName.endsWith(ext) ? safeName : (safeName + ext);
@@ -1350,8 +1370,8 @@
         };
 
         const rootDirHandle = await getDirectoryHandle();
-        const artistName = String(item.artist || item.fullArtist || trackData.artist || '未知歌手').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim();
-        const albumName = String(item.name || item.fullTitle || item.album || trackData.album || '未知专辑').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim();
+        const artistName = String(item.artist || item.fullArtist || trackData.artist || '未知歌手').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().replace(/[\s._]+$/g, '') || '未知歌手';
+        const albumName = String(item.name || item.fullTitle || item.album || trackData.album || '未知专辑').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().replace(/[\s._]+$/g, '') || '未知专辑';
 
         const artistDirHandle = await rootDirHandle.getDirectoryHandle(artistName, { create: true });
         const calcTotalDiscs = item.tracks && item.tracks.length !== 0
@@ -1435,9 +1455,9 @@
 
                         if (!isVideo && metaObj.coverUrl) {
                             try {
-                                const coverResp = await gmFetchRaw(metaObj.coverUrl.replace(/\d+x\d+/, '2000x2000'), { responseType: 'arraybuffer' });
-                                if (coverResp.status === 200 && coverResp.response) {
-                                    ff.FS('writeFile', 'cover.jpg', new Uint8Array(coverResp.response));
+                                const coverBuf = await fetchCoverBuffer(metaObj.coverUrl);
+                                if (coverBuf) {
+                                    ff.FS('writeFile', 'cover.jpg', new Uint8Array(coverBuf));
                                     ffmpegArgs.push('-i', 'cover.jpg', '-map', '0:a:0', '-map', '1:0', '-c:a', 'copy', '-c:v', 'copy', '-disposition:v:0', 'attached_pic');
                                 } else {
                                     ffmpegArgs.push('-map', '0:a:0', '-c:a', 'copy');
@@ -1525,7 +1545,7 @@
         try {
             const amDecrypt = pageWindow.AmDecrypt || window.AmDecrypt;
             const fullDlUrl = dlUrl.startsWith('/') ? (SERVER_URL + dlUrl) : dlUrl;
-            const track = await amDecrypt.openTrack(fullDlUrl);
+            const track = preloadedTrack || await amDecrypt.openTrack(fullDlUrl);
             const calcTotalTracks = trackData.totalTracksInDisc || item.trackCount || (item.tracks ? item.tracks.length : 1);
 
             metaObj = {
@@ -1564,6 +1584,7 @@
                 track.meta = metaObj;
             }
 
+            let hasTriggeredPreload = false;
             await amDecrypt.download(track, tmpFileName, {
                 filename: tmpFileName,
                 fileName: tmpFileName,
@@ -1573,6 +1594,10 @@
                 meta: metaObj,
                 onProgress: function(done, total) {
                     if (isDownloadCancelled) throw new Error('用户取消下载');
+                    if (!hasTriggeredPreload && typeof onDownloadActive === 'function') {
+                        hasTriggeredPreload = true;
+                        onDownloadActive();
+                    }
                     const pct = total ? Math.round((done / total) * 100) : 0;
                     onProgressUpdate('解密: ' + pct + '%', false, pct, calcSpeed(done));
                 }
@@ -1672,10 +1697,10 @@
 
                 if (isVideoUrl || fullItem.type === 'video' || fullItem.type === 'music-video') {
                     const rootDirHandle = await getDirectoryHandle();
-                    const artistName = String(fullItem.artist || fullItem.fullArtist || '未知歌手').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim();
+                    const artistName = String(fullItem.artist || fullItem.fullArtist || '未知歌手').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().replace(/[\s._]+$/g, '') || '未知歌手';
                     const artistDirHandle = await rootDirHandle.getDirectoryHandle(artistName, { create: true });
                     const targetDirHandle = await artistDirHandle.getDirectoryHandle('video', { create: true });
-                    const safeName = String(fullItem.name || fullItem.title || 'MV').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim();
+                    const safeName = String(fullItem.name || fullItem.title || 'MV').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().replace(/[\s.]+$/g, '') || 'MV';
                     const finalFileName = safeName + '.mp4';
 
                     try {
@@ -1782,25 +1807,29 @@
                     try {
                         updateToastProgress({ status: 'running', trackName: '正在保存专辑封面...' });
                         const rootDirHandle = await getDirectoryHandle();
-                        const artistName = String(fullItem.artist || '未知歌手').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim();
-                        const albumName = String(fullItem.name || '未知专辑').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim();
+                        const artistName = String(fullItem.artist || '未知歌手').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().replace(/[\s._]+$/g, '') || '未知歌手';
+                        const albumName = String(fullItem.name || '未知专辑').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().replace(/[\s._]+$/g, '') || '未知专辑';
                         const artistDirHandle = await rootDirHandle.getDirectoryHandle(artistName, { create: true });
                         const albumDirHandle = await artistDirHandle.getDirectoryHandle(albumName, { create: true });
 
-                        const coverResp = await gmFetchRaw(fullItem.coverUrl.replace(/\d+x\d+/, '2000x2000'), { responseType: 'arraybuffer' });
-                        if (coverResp.status === 200 && coverResp.response) {
+                        const coverBuf = await fetchCoverBuffer(fullItem.coverUrl);
+                        if (coverBuf) {
                             const coverHandle = await albumDirHandle.getFileHandle('cover.jpg', { create: true });
                             const coverWritable = await coverHandle.createWritable();
-                            await coverWritable.write(coverResp.response);
+                            await coverWritable.write(coverBuf);
                             await coverWritable.close();
                         }
                     } catch (e) {
                         console.warn('保存封面失败:', e);
                     }
+                } else if (fullItem.coverUrl) {
+                    fetchCoverBuffer(fullItem.coverUrl);
                 }
 
+                await ensureAmDecryptLoaded();
+
                 let successCount = 0;
-                let maxAlbumSampleRate = quality === 'hires' ? 88200 : 0;
+                const isAlbumHires = quality === 'hires' && Array.isArray(fullItem.audioTraits) && fullItem.audioTraits.includes('hi-res-lossless');
 
                 const discCounts = {};
                 const trackDiscIndex = tracks.map(function(t) {
@@ -1811,7 +1840,56 @@
                 const totalDiscs = Math.max(1, ...tracks.map(function(t) { return t.disk_number || t.disc_number || t.discNumber || 1; }));
 
                 let nextTrackIndex = 0;
+                let preloadIndex = 0;
                 const concurrencyLimit = 3;
+                const preloadTasks = new Array(tracks.length);
+
+                function prepareTrackAt(i) {
+                    if (preloadIndex <= i) {
+                        preloadIndex = i + 1;
+                    }
+                    if (!preloadTasks[i]) {
+                        preloadTasks[i] = (async function() {
+                            const trackLight = tracks[i];
+                            const discNum = trackLight.disk_number || trackLight.disc_number || trackLight.discNumber || 1;
+                            const reorderedTrackNum = trackDiscIndex[i];
+                            const queryTarget = trackLight.rawUrl || trackLight.id;
+                            const hasTrackTraits = Array.isArray(trackLight.audioTraits) && trackLight.audioTraits.length > 0;
+                            const isTrackHires = (quality === 'hires') && (hasTrackTraits ? trackLight.audioTraits.includes('hi-res-lossless') : isAlbumHires);
+                            const targetMinRate = isTrackHires ? 88200 : -1;
+                            const trackHeavy = await getAlbumDetails({ id: trackLight.id, rawUrl: queryTarget }, false, targetMinRate, false);
+                            const heavyTrack = trackHeavy.tracks[0];
+                            heavyTrack.disk_number = discNum;
+                            heavyTrack.trackNumber = reorderedTrackNum;
+                            heavyTrack.track_number = reorderedTrackNum;
+                            heavyTrack.totalTracksInDisc = discCounts[discNum];
+                            if (!heavyTrack.coverUrl && fullItem.coverUrl) {
+                                heavyTrack.coverUrl = fullItem.coverUrl;
+                            }
+                            const dlUrl = selectStreamUrl(heavyTrack, quality);
+                            let preloadedTrack = null;
+                            const cleanDlPath = String(dlUrl || '').split('?')[0].toLowerCase();
+                            const amDecrypt = pageWindow.AmDecrypt || window.AmDecrypt;
+                            if (dlUrl && !dlUrl.startsWith('/proxy_seg') && !cleanDlPath.endsWith('.mp4') && !cleanDlPath.endsWith('.m4v') && amDecrypt) {
+                                const fullDlUrl = dlUrl.startsWith('/') ? (SERVER_URL + dlUrl) : dlUrl;
+                                preloadedTrack = await amDecrypt.openTrack(fullDlUrl);
+                            }
+                            return { heavyTrack: heavyTrack, dlUrl: dlUrl, preloadedTrack: preloadedTrack };
+                        })();
+                    }
+                    return preloadTasks[i];
+                }
+
+                function triggerNextPreload() {
+                    if (isDownloadCancelled) return;
+                    if (preloadIndex < nextTrackIndex) {
+                        preloadIndex = nextTrackIndex;
+                    }
+                    if (preloadIndex < tracks.length && preloadIndex < nextTrackIndex + concurrencyLimit) {
+                        const pIdx = preloadIndex++;
+                        prepareTrackAt(pIdx).catch(function() {});
+                    }
+                }
 
                 async function trackWorker() {
                     while (nextTrackIndex < tracks.length) {
@@ -1819,7 +1897,6 @@
                         const i = nextTrackIndex++;
                         const trackLight = tracks[i];
 
-                        const discNum = trackLight.disk_number || trackLight.disc_number || trackLight.discNumber || 1;
                         const reorderedTrackNum = trackDiscIndex[i];
                         const trackNum = String(reorderedTrackNum).padStart(2, '0');
                         const cleanName = trackLight.title || trackLight.name || fullItem.fullTitle || ('Track_' + trackNum);
@@ -1835,31 +1912,16 @@
                         });
 
                         try {
-                            const queryTarget = trackLight.rawUrl || trackLight.id;
-                            const targetMinRate = quality === 'hires' ? maxAlbumSampleRate : -1;
-                            const trackHeavy = await getAlbumDetails({ id: trackLight.id, rawUrl: queryTarget }, false, targetMinRate, false);
-                            const heavyTrack = trackHeavy.tracks[0];
-                            heavyTrack.disk_number = discNum;
-                            heavyTrack.trackNumber = reorderedTrackNum;
-                            heavyTrack.track_number = reorderedTrackNum;
-                            heavyTrack.totalTracksInDisc = discCounts[discNum];
-                            if (!heavyTrack.coverUrl && fullItem.coverUrl) {
-                                heavyTrack.coverUrl = fullItem.coverUrl;
-                            }
-                            if (quality === 'hires' && heavyTrack.variants) {
-                                heavyTrack.variants.forEach(function(v) {
-                                    if (v.sampleRate && Math.max(v.sampleRate, maxAlbumSampleRate) === v.sampleRate) {
-                                        maxAlbumSampleRate = v.sampleRate;
-                                    }
-                                });
-                            }
-                            const dlUrl = selectStreamUrl(heavyTrack, quality);
+                            const prep = await prepareTrackAt(i);
+                            const heavyTrack = prep.heavyTrack;
+                            const dlUrl = prep.dlUrl;
+                            const preloadedTrack = prep.preloadedTrack;
                             if (!dlUrl) {
                                 console.warn('跳过无流地址曲目:', trackTitle);
                                 continue;
                             }
 
-                            await downloadSingleTrackInternal(fullItem, heavyTrack, trackTitle, dlUrl);
+                            await downloadSingleTrackInternal(fullItem, heavyTrack, trackTitle, dlUrl, preloadedTrack, triggerNextPreload);
                             if (!isDownloadCancelled) {
                                 successCount++;
                                 updateToastProgress({
@@ -1967,7 +2029,7 @@
 
                 for (const [i, trackItem] of tracks.entries()) {
                     try {
-                        const tData = await gmFetchJson('/api/parse?q=' + encodeURIComponent(trackItem.rawUrl || trackItem.id) + '&lightweight=0&sf=' + encodeURIComponent(sf));
+                        const tData = await gmFetchJson('/api/parse?q=' + encodeURIComponent(trackItem.rawUrl || trackItem.id) + '&lightweight=0&min_rate=-1&sf=' + encodeURIComponent(sf));
                         const heavyTrack = (tData && tData.tracks && tData.tracks[0]) || {};
                         qualities[i] = heavyTrack.label || '未知音质';
                     } catch (err) {
