@@ -15,6 +15,8 @@
 // @connect      itunes.apple.com
 // @connect      mzstatic.com
 // @connect      *
+// @updateURL    https://raw.githubusercontent.com/sky8282/Tampermonkey_applemusic/refs/heads/main/Tampermonkey_applemusic.js
+// @downloadURL  https://raw.githubusercontent.com/sky8282/Tampermonkey_applemusic/refs/heads/main/Tampermonkey_applemusic.js
 // ==/UserScript==
 
 (function() {
