@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Apple Music 下载助手
 // @namespace    http://tampermonkey.net/
-// @version      0.3
+// @version      0.4
 // @author       @sky82813
 // @description  在 Apple Music 官网直接下载音视频
 // @match        https://music.apple.com/*
@@ -2345,13 +2345,34 @@
         appBridge.onAlbumInfoResult(function(data) {
             if (!data) return;
 
+            const traits = (data.audioTraits || []).slice();
+            const hasHiRes = traits.includes('hi-res-lossless');
+            const hasLossless = traits.includes('lossless') || hasHiRes;
+            const hasAtmos = traits.includes('atmos');
+            
+            const isAAC = !hasLossless && !hasHiRes && !hasAtmos;
+
+            let styleEl = document.getElementById('dynamic-dl-btns-style');
+            if (!styleEl) {
+                styleEl = document.createElement('style');
+                styleEl.id = 'dynamic-dl-btns-style';
+                document.head.appendChild(styleEl);
+            }
+
+            let cssRules = '';
+            if (isAAC) {
+                cssRules = '.primary-actions .custom-button-container, .songs-list-row__controls .custom-button-container { display: none !important; }';
+            } else {
+                if (!hasHiRes) cssRules += '.header-btn-hires { display: none !important; }\n';
+                if (!hasLossless) cssRules += '.header-btn-lossless { display: none !important; }\n';
+                if (!hasAtmos) cssRules += '.header-btn-atmos { display: none !important; }\n';
+            }
+            styleEl.textContent = cssRules;
+
             waitForElement('.headings__metadata-bottom').then(function(metaEl) {
                 if (!metaEl) return;
-
                 const oldBadges = document.querySelector('.ame-album-badges-container');
                 if (oldBadges) oldBadges.remove();
-
-                const traits = (data.audioTraits || []).slice();
                 if (data.isMasteredForItunes) {
                     traits.push('adm');
                 }
@@ -2391,6 +2412,8 @@
         offAlbumRoute(function() {
             const oldBadges = document.querySelector('.ame-album-badges-container');
             if (oldBadges) oldBadges.remove();
+            const style = document.getElementById('dynamic-dl-btns-style');
+            if (style) style.remove();
         });
     }
 
@@ -2441,6 +2464,10 @@
         const hiresBtn = createButtons(url, details, false, 'hires', 'Hi-Res', 'dl-btn-green');
         const losslessBtn = createButtons(url, details, false, 'lossless', 'Lossless', 'dl-btn-green');
         const atmosBtn = createButtons(url, details, false, 'atmos', 'Atmos', 'dl-btn-red');
+        
+        hiresBtn.classList.add('header-btn-hires');
+        losslessBtn.classList.add('header-btn-lossless');
+        atmosBtn.classList.add('header-btn-atmos');
 
         buttonContainer.appendChild(hiresBtn);
         buttonContainer.appendChild(losslessBtn);
