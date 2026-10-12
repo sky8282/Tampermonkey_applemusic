@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Apple Music 下载助手
 // @namespace    http://tampermonkey.net/
-// @version      0.4
+// @version      0.0.5
 // @author       @sky82813
 // @description  在 Apple Music 官网直接下载音视频
 // @match        https://music.apple.com/*
@@ -23,7 +23,7 @@
     'use strict';
 
     const SERVER_URL = 'https://t.kimu.edu.kg';
-    
+
     const END_CHAR = String.fromCharCode(36);
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const gmXhr = (typeof GM_xmlhttpRequest === 'function')
@@ -1379,6 +1379,337 @@
         return cachedCoverPromise;
     }
 
+    function buildMp4FreeformAtom(name, value, mean = 'com.apple.iTunes') {
+        const enc = new TextEncoder();
+        const meanBytes = enc.encode(mean);
+        const nameBytes = enc.encode(name);
+        const valBytes = enc.encode(String(value));
+        const meanSize = 12 + meanBytes.byteLength;
+        const nameSize = 12 + nameBytes.byteLength;
+        const dataSize = 16 + valBytes.byteLength;
+        const totalSize = 8 + meanSize + nameSize + dataSize;
+        const buf = new Uint8Array(totalSize);
+        const dv = new DataView(buf.buffer);
+        let p = 0;
+        dv.setUint32(p, totalSize, false);
+        buf.set([0x2d, 0x2d, 0x2d, 0x2d], p + 4);
+        p += 8;
+        dv.setUint32(p, meanSize, false);
+        buf.set([0x6d, 0x65, 0x61, 0x6e], p + 4);
+        dv.setUint32(p + 8, 0, false);
+        buf.set(meanBytes, p + 12);
+        p += meanSize;
+        dv.setUint32(p, nameSize, false);
+        buf.set([0x6e, 0x61, 0x6d, 0x65], p + 4);
+        dv.setUint32(p + 8, 0, false);
+        buf.set(nameBytes, p + 12);
+        p += nameSize;
+        dv.setUint32(p, dataSize, false);
+        buf.set([0x64, 0x61, 0x74, 0x61], p + 4);
+        dv.setUint32(p + 8, 1, false);
+        dv.setUint32(p + 12, 0, false);
+        buf.set(valBytes, p + 16);
+        return buf;
+    }
+
+    function injectMp4FreeformTags(buffer, metaObj, coverBuf) {
+        const u8 = new Uint8Array(buffer);
+        const dv = new DataView(u8.buffer);
+
+        const readBoxes = function(start, end) {
+            const list = [];
+            let pos = start;
+            while (pos + 8 <= end) {
+                let sz = dv.getUint32(pos, false);
+                const tp = String.fromCharCode(u8[pos + 4], u8[pos + 5], u8[pos + 6], u8[pos + 7]);
+                let hdr = 8;
+                if (sz === 1) {
+                    if (pos + 16 > end) break;
+                    sz = dv.getUint32(pos + 8, false) * 4294967296 + dv.getUint32(pos + 12, false);
+                    hdr = 16;
+                } else if (sz === 0) {
+                    sz = end - pos;
+                }
+                if (sz < hdr || pos + sz > end) break;
+                list.push({ type: tp, offset: pos, size: sz, payload: pos + hdr, end: pos + sz });
+                pos += sz;
+            }
+            return list;
+        };
+
+        const topBoxes = readBoxes(0, u8.byteLength);
+        const moov = topBoxes.find(function(b) { return b.type === 'moov'; });
+        if (!moov) {
+            return buffer;
+        }
+
+        if (metaObj.durationInMillis) {
+            const mvhd = readBoxes(moov.payload, moov.end).find(function(b) { return b.type === 'mvhd'; });
+            let globalTs = 1000;
+            if (mvhd) {
+                const version = u8[mvhd.payload];
+                const tsOff = mvhd.payload + (version === 1 ? 20 : 12);
+                const durOff = mvhd.payload + (version === 1 ? 24 : 16);
+                globalTs = dv.getUint32(tsOff, false) || 1000;
+                const dur = Math.floor((metaObj.durationInMillis * globalTs) / 1000);
+                if (version === 1) {
+                    dv.setUint32(durOff, Math.floor(dur / 4294967296), false);
+                    dv.setUint32(durOff + 4, dur >>> 0, false);
+                } else {
+                    dv.setUint32(durOff, dur >>> 0, false);
+                }
+            }
+
+            const mvex = readBoxes(moov.payload, moov.end).find(function(b) { return b.type === 'mvex'; });
+            if (mvex) {
+                const mehd = readBoxes(mvex.payload, mvex.end).find(function(b) { return b.type === 'mehd'; });
+                if (mehd) {
+                    const version = u8[mehd.payload];
+                    const durOff = mehd.payload + 4;
+                    const dur = Math.floor((metaObj.durationInMillis * globalTs) / 1000);
+                    if (version === 1) {
+                        dv.setUint32(durOff, Math.floor(dur / 4294967296), false);
+                        dv.setUint32(durOff + 4, dur >>> 0, false);
+                    } else {
+                        dv.setUint32(durOff, dur >>> 0, false);
+                    }
+                }
+            }
+
+            const trakList = readBoxes(moov.payload, moov.end).filter(function(b) { return b.type === 'trak'; });
+            for (let i = 0; i < trakList.length; i++) {
+                const trak = trakList[i];
+                const tkhd = readBoxes(trak.payload, trak.end).find(function(b) { return b.type === 'tkhd'; });
+                if (tkhd) {
+                    const version = u8[tkhd.payload];
+                    const durOff = tkhd.payload + (version === 1 ? 28 : 20);
+                    const dur = Math.floor((metaObj.durationInMillis * globalTs) / 1000);
+                    if (version === 1) {
+                        dv.setUint32(durOff, Math.floor(dur / 4294967296), false);
+                        dv.setUint32(durOff + 4, dur >>> 0, false);
+                    } else {
+                        dv.setUint32(durOff, dur >>> 0, false);
+                    }
+                }
+                const mdia = readBoxes(trak.payload, trak.end).find(function(b) { return b.type === 'mdia'; });
+                if (mdia) {
+                    const mdhd = readBoxes(mdia.payload, mdia.end).find(function(b) { return b.type === 'mdhd'; });
+                    if (mdhd) {
+                        const version = u8[mdhd.payload];
+                        const tsOff = mdhd.payload + (version === 1 ? 20 : 12);
+                        const durOff = mdhd.payload + (version === 1 ? 24 : 16);
+                        const timescale = dv.getUint32(tsOff, false) || 1000;
+                        const dur = Math.floor((metaObj.durationInMillis * timescale) / 1000);
+                        if (version === 1) {
+                            dv.setUint32(durOff, Math.floor(dur / 4294967296), false);
+                            dv.setUint32(durOff + 4, dur >>> 0, false);
+                        } else {
+                            dv.setUint32(durOff, dur >>> 0, false);
+                        }
+                    }
+                }
+            }
+        }
+
+        const atoms = [];
+        const enc = new TextEncoder();
+
+        const buildAtom = function(type, dataU8, dataType = 1) {
+            const size = 24 + dataU8.byteLength;
+            const b = new Uint8Array(size);
+            const d = new DataView(b.buffer);
+            d.setUint32(0, size, false);
+            for (let i = 0; i < 4; i++) b[4 + i] = type.charCodeAt(i);
+            d.setUint32(8, 16 + dataU8.byteLength, false);
+            b.set([0x64, 0x61, 0x74, 0x61], 12);
+            d.setUint32(16, dataType, false);
+            d.setUint32(20, 0, false);
+            b.set(dataU8, 24);
+            return b;
+        };
+
+        if (metaObj.title) atoms.push(buildAtom('\xA9nam', enc.encode(metaObj.title)));
+        if (metaObj.artist) atoms.push(buildAtom('\xA9ART', enc.encode(metaObj.artist)));
+        if (metaObj.albumArtist) atoms.push(buildAtom('aART', enc.encode(metaObj.albumArtist)));
+        if (metaObj.composer) {
+            atoms.push(buildAtom('\xA9wrt', enc.encode(metaObj.composer)));
+            atoms.push(buildMp4FreeformAtom('COMPOSER', metaObj.composer));
+        }
+        if (metaObj.work) {
+            atoms.push(buildAtom('\xA9wrk', enc.encode(metaObj.work)));
+            atoms.push(buildMp4FreeformAtom('WORK', metaObj.work));
+        }
+        if (metaObj.grouping) {
+            atoms.push(buildAtom('\xA9grp', enc.encode(metaObj.grouping)));
+            atoms.push(buildMp4FreeformAtom('GROUPING', metaObj.grouping));
+        }
+        if (metaObj.movement) {
+            atoms.push(buildAtom('\xA9mvn', enc.encode(metaObj.movement)));
+            atoms.push(buildMp4FreeformAtom('MOVEMENTNAME', metaObj.movement));
+        }
+        if (metaObj.album) atoms.push(buildAtom('\xA9alb', enc.encode(metaObj.album)));
+        if (metaObj.genre) atoms.push(buildAtom('\xA9gen', enc.encode(metaObj.genre)));
+        if (metaObj.releaseDate || metaObj.year) atoms.push(buildAtom('\xA9day', enc.encode(metaObj.releaseDate || metaObj.year)));
+        if (metaObj.copyright) {
+            atoms.push(buildAtom('cprt', enc.encode(metaObj.copyright)));
+            atoms.push(buildMp4FreeformAtom('COPYRIGHT', metaObj.copyright));
+        }
+        if (metaObj.comment || metaObj.description) atoms.push(buildAtom('\xA9cmt', enc.encode(metaObj.comment || metaObj.description)));
+        if (metaObj.lyrics) atoms.push(buildAtom('\xA9lyr', enc.encode(metaObj.lyrics)));
+
+        if (metaObj.trackNumber || metaObj.totalTracks) {
+            const tU8 = new Uint8Array(8);
+            const td = new DataView(tU8.buffer);
+            td.setUint16(2, metaObj.trackNumber || 0, false);
+            td.setUint16(4, metaObj.totalTracks || 0, false);
+            atoms.push(buildAtom('trkn', tU8, 0));
+        }
+        if (metaObj.discNumber || metaObj.totalDiscs) {
+            const dU8 = new Uint8Array(6);
+            const dd = new DataView(dU8.buffer);
+            dd.setUint16(2, metaObj.discNumber || 0, false);
+            dd.setUint16(4, metaObj.totalDiscs || 0, false);
+            atoms.push(buildAtom('disk', dU8, 0));
+        }
+        if (coverBuf && coverBuf.byteLength > 0) {
+            const isPng = coverBuf[0] === 0x89 && coverBuf[1] === 0x50;
+            atoms.push(buildAtom('covr', coverBuf, isPng ? 14 : 13));
+        }
+        if (metaObj.isrc) atoms.push(buildMp4FreeformAtom('ISRC', metaObj.isrc));
+        if (metaObj.upc) atoms.push(buildMp4FreeformAtom('UPC', metaObj.upc));
+
+        if (atoms.length === 0) {
+            return buffer;
+        }
+
+        const delta = atoms.reduce(function(acc, a) { return acc + a.byteLength; }, 0);
+
+        const udta = readBoxes(moov.payload, moov.end).find(function(b) { return b.type === 'udta'; });
+        let meta, ilst;
+        let insertionOffset = moov.end;
+        let prependData = new Uint8Array(0);
+
+        const hdlrHeader = new Uint8Array([
+            0, 0, 0, 34,
+            0x68, 0x64, 0x6c, 0x72,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0x6d, 0x64, 0x69, 0x72,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0
+        ]);
+
+        const ilstHeader = new Uint8Array(8);
+        new DataView(ilstHeader.buffer).setUint32(0, 8 + delta, false);
+        ilstHeader.set([0x69, 0x6c, 0x73, 0x74], 4);
+
+        if (udta) {
+            meta = readBoxes(udta.payload, udta.end).find(function(b) { return b.type === 'meta'; });
+            if (meta) {
+                ilst = readBoxes(meta.payload + 4, meta.end).find(function(b) { return b.type === 'ilst'; });
+                if (ilst) {
+                    insertionOffset = ilst.end;
+                    const updateDv = new DataView(u8.buffer);
+                    updateDv.setUint32(udta.offset, udta.size + delta, false);
+                    updateDv.setUint32(meta.offset, meta.size + delta, false);
+                    updateDv.setUint32(ilst.offset, ilst.size + delta, false);
+                } else {
+                    insertionOffset = meta.end;
+                    prependData = ilstHeader;
+                    const updateDv = new DataView(u8.buffer);
+                    updateDv.setUint32(udta.offset, udta.size + 8 + delta, false);
+                    updateDv.setUint32(meta.offset, meta.size + 8 + delta, false);
+                }
+            } else {
+                insertionOffset = udta.end;
+                const metaHeader = new Uint8Array(12);
+                new DataView(metaHeader.buffer).setUint32(0, 12 + 34 + 8 + delta, false);
+                metaHeader.set([0x6d, 0x65, 0x74, 0x61, 0, 0, 0, 0], 4);
+
+                prependData = new Uint8Array(12 + 34 + 8);
+                prependData.set(metaHeader, 0);
+                prependData.set(hdlrHeader, 12);
+                prependData.set(ilstHeader, 12 + 34);
+
+                const updateDv = new DataView(u8.buffer);
+                updateDv.setUint32(udta.offset, udta.size + prependData.byteLength + delta, false);
+            }
+        } else {
+            insertionOffset = moov.end;
+            const metaHeader = new Uint8Array(12);
+            new DataView(metaHeader.buffer).setUint32(0, 12 + 34 + 8 + delta, false);
+            metaHeader.set([0x6d, 0x65, 0x74, 0x61, 0, 0, 0, 0], 4);
+
+            const udtaHeader = new Uint8Array(8);
+            new DataView(udtaHeader.buffer).setUint32(0, 8 + 12 + 34 + 8 + delta, false);
+            udtaHeader.set([0x75, 0x64, 0x74, 0x61], 4);
+
+            prependData = new Uint8Array(8 + 12 + 34 + 8);
+            prependData.set(udtaHeader, 0);
+            prependData.set(metaHeader, 8);
+            prependData.set(hdlrHeader, 8 + 12);
+            prependData.set(ilstHeader, 8 + 12 + 34);
+        }
+
+        const realDelta = delta + prependData.byteLength;
+
+        const shiftOffsets = function(start, end) {
+            const boxes = readBoxes(start, end);
+            for (let i = 0; i < boxes.length; i++) {
+                const b = boxes[i];
+                if (['trak', 'mdia', 'minf', 'stbl'].includes(b.type)) {
+                    shiftOffsets(b.payload, b.end);
+                } else if (b.type === 'stco') {
+                    const count = dv.getUint32(b.payload + 4, false);
+                    for (let j = 0; j < count; j++) {
+                        const offPos = b.payload + 8 + j * 4;
+                        if (offPos + 4 <= b.end) {
+                            const oldVal = dv.getUint32(offPos, false);
+                            if (oldVal >= insertionOffset) dv.setUint32(offPos, oldVal + realDelta, false);
+                        }
+                    }
+                } else if (b.type === 'co64') {
+                    const count = dv.getUint32(b.payload + 4, false);
+                    for (let j = 0; j < count; j++) {
+                        const offPos = b.payload + 8 + j * 8;
+                        if (offPos + 8 <= b.end) {
+                            const hi = dv.getUint32(offPos, false);
+                            const lo = dv.getUint32(offPos + 4, false);
+                            const oldVal = hi * 4294967296 + lo;
+                            if (oldVal >= insertionOffset) {
+                                const newVal = oldVal + realDelta;
+                                dv.setUint32(offPos, Math.floor(newVal / 4294967296), false);
+                                dv.setUint32(offPos + 4, newVal >>> 0, false);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        shiftOffsets(moov.payload, moov.end);
+
+        dv.setUint32(moov.offset, moov.size + realDelta, false);
+
+        const out = new Uint8Array(u8.byteLength + realDelta);
+        out.set(u8.subarray(0, insertionOffset), 0);
+
+        let cursor = insertionOffset;
+        if (prependData.byteLength > 0) {
+            out.set(prependData, cursor);
+            cursor += prependData.byteLength;
+        }
+
+        for (let i = 0; i < atoms.length; i++) {
+            const a = atoms[i];
+            out.set(a, cursor);
+            cursor += a.byteLength;
+        }
+
+        out.set(u8.subarray(insertionOffset), cursor);
+        return out.buffer;
+    }
+
     async function downloadSingleTrackInternal(item, trackData, trackTitle, dlUrl, preloadedTrack, onDownloadActive) {
         await ensureAmDecryptLoaded();
         installBlobClickHook();
@@ -1488,103 +1819,73 @@
                         throw new Error('未在内存映射中找到音频 Blob 数据');
                     }
                     let fileBuffer = await rawBlob.arrayBuffer();
-                    const rawBackupBuffer = fileBuffer.slice(0);
                     pageWindow.__am_blob_store.delete(blobUrl);
                     try { URL.revokeObjectURL(blobUrl); } catch (e) {}
 
                     try {
-                        onProgressUpdate('FFmpeg写入元数据中...');
-                        const ff = await getFFmpegInstance();
-                        const randHash = Math.random().toString(36).slice(2, 8);
-                        const inputName = 'in_' + Date.now() + '_' + randHash + ext;
-                        const outputName = 'out_' + Date.now() + '_' + randHash + ext;
+                        onProgressUpdate('写入元数据中...');
+                        const fileSize = fileBuffer.byteLength;
 
-                        ff.FS('writeFile', inputName, new Uint8Array(fileBuffer));
-                        const ffmpegArgs = ['-y', '-i', inputName];
-
+                        let coverBuf = null;
                         if (!isVideo && metaObj.coverUrl) {
                             try {
-                                const coverBuf = await fetchCoverBuffer(metaObj.coverUrl);
-                                if (coverBuf) {
-                                    ff.FS('writeFile', 'cover.jpg', new Uint8Array(coverBuf));
-                                    ffmpegArgs.push('-i', 'cover.jpg', '-map', '0:a:0', '-map', '1:0', '-c:a', 'copy', '-c:v', 'copy', '-disposition:v:0', 'attached_pic');
-                                } else {
-                                    ffmpegArgs.push('-map', '0:a:0', '-c:a', 'copy');
+                                const buf = await fetchCoverBuffer(metaObj.coverUrl);
+                                if (buf) coverBuf = new Uint8Array(buf);
+                            } catch (e) {}
+                        }
+
+                        if (!isVideo && fileSize > 0) {
+                            const u8 = new Uint8Array(fileBuffer);
+                            const dv = new DataView(u8.buffer);
+
+                            let pos = 0;
+                            let splitPos = -1;
+
+                            while (pos + 8 <= u8.byteLength) {
+                                let size = dv.getUint32(pos, false);
+                                const type = String.fromCharCode(u8[pos + 4], u8[pos + 5], u8[pos + 6], u8[pos + 7]);
+                                if (size === 1) {
+                                    if (pos + 16 > u8.byteLength) break;
+                                    size = dv.getUint32(pos + 8, false) * 4294967296 + dv.getUint32(pos + 12, false);
+                                } else if (size === 0) {
+                                    size = fileSize - pos;
                                 }
-                            } catch (coverErr) {
-                                ffmpegArgs.push('-map', '0:a:0', '-c:a', 'copy');
+
+                                if (type === 'moof' || type === 'mdat') {
+                                    splitPos = pos;
+                                    break;
+                                }
+
+                                pos += size;
                             }
-                        } else if (!isVideo) {
-                            ffmpegArgs.push('-map', '0:a:0', '-c:a', 'copy');
-                        } else {
-                            ffmpegArgs.push('-c', 'copy');
-                        }
 
-                        ffmpegArgs.push('-map_metadata', '-1');
-                        ffmpegArgs.push('-movflags', '+faststart');
+                            if (splitPos > 0 && splitPos <= u8.byteLength) {
+                                const headerData = u8.slice(0, splitPos);
+                                let finalBuf = headerData.buffer;
 
-                        if (metaObj.title) ffmpegArgs.push('-metadata', 'title=' + metaObj.title);
-                        if (metaObj.artist) ffmpegArgs.push('-metadata', 'artist=' + metaObj.artist);
-                        if (metaObj.albumArtist) ffmpegArgs.push('-metadata', 'album_artist=' + metaObj.albumArtist);
-                        if (metaObj.album) ffmpegArgs.push('-metadata', 'album=' + metaObj.album);
-                        ffmpegArgs.push('-metadata', 'track=' + metaObj.trackNumber + '/' + metaObj.totalTracks);
-                        ffmpegArgs.push('-metadata', 'disc=' + metaObj.discNumber + '/' + metaObj.totalDiscs);
-                        if (metaObj.releaseDate || metaObj.year) ffmpegArgs.push('-metadata', 'date=' + (metaObj.releaseDate || metaObj.year));
+                                try {
+                                    finalBuf = injectMp4FreeformTags(finalBuf, metaObj, coverBuf);
+                                } catch (e) {}
 
-                        if (!isAtmosTrack) {
-                            if (metaObj.lyrics) ffmpegArgs.push('-metadata', 'lyrics=' + metaObj.lyrics);
-                            if (metaObj.genre) ffmpegArgs.push('-metadata', 'genre=' + metaObj.genre);
-                            if (metaObj.copyright) ffmpegArgs.push('-metadata', 'copyright=' + metaObj.copyright);
-                            if (metaObj.description) {
-                                ffmpegArgs.push('-metadata', 'description=' + metaObj.description);
-                                ffmpegArgs.push('-metadata', 'comment=' + metaObj.description);
-                                ffmpegArgs.push('-metadata', 'synopsis=' + metaObj.description);
-                            }
-                            if (metaObj.isrc) ffmpegArgs.push('-metadata', 'isrc=' + metaObj.isrc);
-                            if (metaObj.upc) ffmpegArgs.push('-metadata', 'upc=' + metaObj.upc);
-                        }
-
-                        if (isAtmosTrack) {
-                            ffmpegArgs.push('-f', 'mp4');
-                        }
-                        ffmpegArgs.push(outputName);
-
-                        try {
-                            await ff.run.apply(ff, ffmpegArgs);
-                        } catch (runErr) {
-                            if (!runErr || !runErr.message || !runErr.message.includes('exit(0)')) {
-                                throw runErr;
+                                const newHeaderData = new Uint8Array(finalBuf);
+                                const outBuf = new Uint8Array(newHeaderData.byteLength + (fileSize - splitPos));
+                                outBuf.set(newHeaderData, 0);
+                                outBuf.set(u8.subarray(splitPos), newHeaderData.byteLength);
+                                fileBuffer = outBuf.buffer;
+                            } else {
+                                try {
+                                    fileBuffer = injectMp4FreeformTags(fileBuffer, metaObj, coverBuf);
+                                } catch (e) {}
                             }
                         }
-
-                        const stat = ff.FS('stat', outputName);
-                        if (!stat || stat.size === 0) {
-                            throw new Error('FFmpeg 生成了 0 字节文件');
-                        }
-                        const outBuffer = ff.FS('readFile', outputName).buffer;
-                        if (outBuffer && outBuffer.byteLength !== 0) {
-                            fileBuffer = outBuffer;
-                        } else {
-                            fileBuffer = rawBackupBuffer;
-                        }
-
-                        try { ff.FS('unlink', inputName); } catch (e) {}
-                        try { ff.FS('unlink', outputName); } catch (e) {}
-                        try { ff.FS('unlink', 'cover.jpg'); } catch (e) {}
-                        try { ff.exit(); } catch (e) {}
-                    } catch (ffErr) {
-                        console.warn('[METADATA WARN] FFmpeg 写入元数据失败，回退保存原始流:', ffErr);
-                        fileBuffer = rawBackupBuffer;
-                    }
+                    } catch (err) {}
 
                     onProgressUpdate('写入本地硬盘...');
                     const writable = await tmpFileHandle.createWritable();
                     await writable.write(fileBuffer);
                     await writable.close();
                     onProgressUpdate('封装完成');
-                } catch (e) {
-                    console.error('写入文件失败:', e);
-                } finally {
+                } catch (e) {} finally {
                     delete pageWindow.__am_blob_tasks[tmpFileName];
                     resolve();
                 }
@@ -1596,6 +1897,10 @@
             const fullDlUrl = dlUrl.startsWith('/') ? (SERVER_URL + dlUrl) : dlUrl;
             const track = preloadedTrack || await amDecrypt.openTrack(fullDlUrl);
             const calcTotalTracks = trackData.totalTracksInDisc || item.trackCount || (item.tracks ? item.tracks.length : 1);
+
+            const apiDurMs = trackData.durationInMillis || trackData.duration || (trackData.attributes && trackData.attributes.durationInMillis) || (item.attributes && item.attributes.durationInMillis) || item.durationInMillis || item.duration || 0;
+            const fallbackDurMs = track && track.duration ? Math.round(track.duration * 1000) : 0;
+            const durMs = apiDurMs || fallbackDurMs;
 
             metaObj = {
                 title: trackData.title || trackTitle || safeName,
@@ -1613,7 +1918,8 @@
                 upc: trackData.upc || item.upc || '',
                 genre: trackData.genre || item.genre || '',
                 copyright: trackData.copyright || item.copyright || '',
-                description: trackData.editorialNotes || item.editorialNotes || ''
+                description: trackData.editorialNotes || item.editorialNotes || '',
+                durationInMillis: durMs
             };
 
             if (!isVideo) {
@@ -1890,13 +2196,12 @@
 
                 let nextTrackIndex = 0;
                 let preloadIndex = 0;
+                //下载线程
                 const concurrencyLimit = 3;
+
                 const preloadTasks = new Array(tracks.length);
 
                 function prepareTrackAt(i) {
-                    if (preloadIndex <= i) {
-                        preloadIndex = i + 1;
-                    }
                     if (!preloadTasks[i]) {
                         preloadTasks[i] = (async function() {
                             const trackLight = tracks[i];
@@ -1929,15 +2234,18 @@
                     return preloadTasks[i];
                 }
 
-                function triggerNextPreload() {
-                    if (isDownloadCancelled) return;
-                    if (preloadIndex < nextTrackIndex) {
-                        preloadIndex = nextTrackIndex;
-                    }
-                    if (preloadIndex < tracks.length && preloadIndex < nextTrackIndex + concurrencyLimit) {
+                async function preloadWorker() {
+                    while (preloadIndex < tracks.length) {
+                        if (isDownloadCancelled) break;
                         const pIdx = preloadIndex++;
-                        prepareTrackAt(pIdx).catch(function() {});
+                        try {
+                            await prepareTrackAt(pIdx);
+                        } catch (e) {}
                     }
+                }
+
+                for (let p = 0; p < Math.min(concurrencyLimit, tracks.length); p++) {
+                    preloadWorker();
                 }
 
                 async function trackWorker() {
@@ -1970,7 +2278,7 @@
                                 continue;
                             }
 
-                            await downloadSingleTrackInternal(fullItem, heavyTrack, trackTitle, dlUrl, preloadedTrack, triggerNextPreload);
+                            await downloadSingleTrackInternal(fullItem, heavyTrack, trackTitle, dlUrl, preloadedTrack, null);
                             if (!isDownloadCancelled) {
                                 successCount++;
                                 updateToastProgress({
@@ -2351,7 +2659,7 @@
             const hasHiRes = traits.includes('hi-res-lossless');
             const hasLossless = traits.includes('lossless') || hasHiRes;
             const hasAtmos = traits.includes('atmos');
-            
+
             const isAAC = !hasLossless && !hasHiRes && !hasAtmos;
 
             let styleEl = document.getElementById('dynamic-dl-btns-style');
@@ -2466,7 +2774,7 @@
         const hiresBtn = createButtons(url, details, false, 'hires', 'Hi-Res', 'dl-btn-green');
         const losslessBtn = createButtons(url, details, false, 'lossless', 'Lossless', 'dl-btn-green');
         const atmosBtn = createButtons(url, details, false, 'atmos', 'Atmos', 'dl-btn-red');
-        
+
         hiresBtn.classList.add('header-btn-hires');
         losslessBtn.classList.add('header-btn-lossless');
         atmosBtn.classList.add('header-btn-atmos');
