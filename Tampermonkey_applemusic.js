@@ -2253,6 +2253,10 @@
                         const cleanName = trackLight.title || trackLight.name || fullItem.fullTitle || ('Track_' + trackNum);
                         const trackTitle = (tracks.length !== 1 || totalDiscs !== 1) ? (trackNum + '. ' + cleanName) : cleanName;
 
+                        if (i + 1 < tracks.length) {
+                            prepareTrackAt(i + 1);
+                        }
+
                         updateToastProgress({
                             status: 'running',
                             albumName: albumTitle,
@@ -2272,7 +2276,13 @@
                                 continue;
                             }
 
-                            await downloadSingleTrackInternal(fullItem, heavyTrack, trackTitle, dlUrl, preloadedTrack, null);
+                            const triggerNextPreload = function() {
+                                if (i + 1 < tracks.length) {
+                                    prepareTrackAt(i + 1);
+                                }
+                            };
+
+                            await downloadSingleTrackInternal(fullItem, heavyTrack, trackTitle, dlUrl, preloadedTrack, triggerNextPreload);
                             if (!isDownloadCancelled) {
                                 successCount++;
                                 updateToastProgress({
