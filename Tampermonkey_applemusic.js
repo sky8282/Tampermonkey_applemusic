@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Apple Music 下载助手
 // @namespace    http://tampermonkey.net/
-// @version      0.0.5
+// @version      0.0.6
 // @author       @sky82813
 // @description  在 Apple Music 官网直接下载音视频
 // @match        https://music.apple.com/*
@@ -23,7 +23,7 @@
     'use strict';
 
     const SERVER_URL = 'https://t.kimu.edu.kg';
-
+    
     const END_CHAR = String.fromCharCode(36);
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const gmXhr = (typeof GM_xmlhttpRequest === 'function')
@@ -1598,7 +1598,7 @@
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0
         ]);
-
+        
         const ilstHeader = new Uint8Array(8);
         new DataView(ilstHeader.buffer).setUint32(0, 8 + delta, false);
         ilstHeader.set([0x69, 0x6c, 0x73, 0x74], 4);
@@ -1693,19 +1693,19 @@
 
         const out = new Uint8Array(u8.byteLength + realDelta);
         out.set(u8.subarray(0, insertionOffset), 0);
-
+        
         let cursor = insertionOffset;
         if (prependData.byteLength > 0) {
             out.set(prependData, cursor);
             cursor += prependData.byteLength;
         }
-
+        
         for (let i = 0; i < atoms.length; i++) {
             const a = atoms[i];
             out.set(a, cursor);
             cursor += a.byteLength;
         }
-
+        
         out.set(u8.subarray(insertionOffset), cursor);
         return out.buffer;
     }
@@ -1811,33 +1811,31 @@
         let metaObj = {};
 
         let blobWritePromise = new Promise(function(resolve) {
-            pageWindow.__am_blob_tasks[tmpFileName] = async function(blobUrl) {
+            pageWindow.__am_blob_tasks[tmpFileName] = async function(blobOrUrl, immediateCleanup) {
                 try {
-                    onProgressUpdate('读取临时文件...');
-                    const rawBlob = pageWindow.__am_blob_store && pageWindow.__am_blob_store.get(blobUrl);
-                    if (!rawBlob) {
-                        throw new Error('未在内存映射中找到音频 Blob 数据');
+                    onProgressUpdate('写入元数据与保存硬盘中...');
+                    let sourceBlob = blobOrUrl;
+                    if (typeof blobOrUrl === 'string') {
+                        const blobResp = await pageWindow.fetch(blobOrUrl);
+                        sourceBlob = await blobResp.blob();
+                        try { URL.revokeObjectURL(blobOrUrl); } catch (e) {}
                     }
-                    let fileBuffer = await rawBlob.arrayBuffer();
-                    pageWindow.__am_blob_store.delete(blobUrl);
-                    try { URL.revokeObjectURL(blobUrl); } catch (e) {}
 
-                    try {
-                        onProgressUpdate('写入元数据中...');
-                        const fileSize = fileBuffer.byteLength;
+                    const fileSize = sourceBlob.size;
+                    let coverBuf = null;
+                    if (!isVideo && metaObj.coverUrl) {
+                        try {
+                            const buf = await fetchCoverBuffer(metaObj.coverUrl);
+                            if (buf) coverBuf = new Uint8Array(buf);
+                        } catch (e) {}
+                    }
 
-                        let coverBuf = null;
-                        if (!isVideo && metaObj.coverUrl) {
-                            try {
-                                const buf = await fetchCoverBuffer(metaObj.coverUrl);
-                                if (buf) coverBuf = new Uint8Array(buf);
-                            } catch (e) {}
-                        }
-
-                        if (!isVideo && fileSize > 0) {
-                            const u8 = new Uint8Array(fileBuffer);
+                    let finalBlobToWrite = sourceBlob;
+                    if (!isVideo && fileSize > 0) {
+                        try {
+                            const headSize = Math.min(fileSize, 8 * 1024 * 1024);
+                            const u8 = new Uint8Array(await sourceBlob.slice(0, headSize).arrayBuffer());
                             const dv = new DataView(u8.buffer);
-
                             let pos = 0;
                             let splitPos = -1;
 
@@ -1855,35 +1853,31 @@
                                     splitPos = pos;
                                     break;
                                 }
-
+                                
                                 pos += size;
                             }
 
                             if (splitPos > 0 && splitPos <= u8.byteLength) {
                                 const headerData = u8.slice(0, splitPos);
-                                let finalBuf = headerData.buffer;
-
-                                try {
-                                    finalBuf = injectMp4FreeformTags(finalBuf, metaObj, coverBuf);
-                                } catch (e) {}
-
-                                const newHeaderData = new Uint8Array(finalBuf);
-                                const outBuf = new Uint8Array(newHeaderData.byteLength + (fileSize - splitPos));
-                                outBuf.set(newHeaderData, 0);
-                                outBuf.set(u8.subarray(splitPos), newHeaderData.byteLength);
-                                fileBuffer = outBuf.buffer;
-                            } else {
-                                try {
-                                    fileBuffer = injectMp4FreeformTags(fileBuffer, metaObj, coverBuf);
-                                } catch (e) {}
+                                const injectedHeader = injectMp4FreeformTags(headerData.buffer, metaObj, coverBuf);
+                                finalBlobToWrite = new Blob([injectedHeader, sourceBlob.slice(splitPos)], { type: 'audio/mp4' });
+                            } else if (fileSize < 120 * 1024 * 1024) {
+                                const fullBuf = await sourceBlob.arrayBuffer();
+                                const injectedFull = injectMp4FreeformTags(fullBuf, metaObj, coverBuf);
+                                finalBlobToWrite = new Blob([injectedFull], { type: 'audio/mp4' });
                             }
-                        }
-                    } catch (err) {}
+                        } catch (err) {}
+                    }
 
-                    onProgressUpdate('写入本地硬盘...');
                     const writable = await tmpFileHandle.createWritable();
-                    await writable.write(fileBuffer);
-                    await writable.close();
+                    if (finalBlobToWrite.stream) {
+                        await finalBlobToWrite.stream().pipeTo(writable);
+                    } else {
+                        await writable.write(await finalBlobToWrite.arrayBuffer());
+                        await writable.close();
+                    }
+
+                    if (typeof immediateCleanup === 'function') immediateCleanup();
                     onProgressUpdate('封装完成');
                 } catch (e) {} finally {
                     delete pageWindow.__am_blob_tasks[tmpFileName];
@@ -2196,9 +2190,9 @@
 
                 let nextTrackIndex = 0;
                 let preloadIndex = 0;
-                //下载线程
-                const concurrencyLimit = 3;
-
+                const threadInputEl = document.getElementById('downloadThreadCount');
+                const concurrencyLimit = threadInputEl ? Math.max(1, parseInt(threadInputEl.value, 10) || 3) : 3;
+                
                 const preloadTasks = new Array(tracks.length);
 
                 function prepareTrackAt(i) {
@@ -2659,7 +2653,7 @@
             const hasHiRes = traits.includes('hi-res-lossless');
             const hasLossless = traits.includes('lossless') || hasHiRes;
             const hasAtmos = traits.includes('atmos');
-
+            
             const isAAC = !hasLossless && !hasHiRes && !hasAtmos;
 
             let styleEl = document.getElementById('dynamic-dl-btns-style');
@@ -2774,7 +2768,7 @@
         const hiresBtn = createButtons(url, details, false, 'hires', 'Hi-Res', 'dl-btn-green');
         const losslessBtn = createButtons(url, details, false, 'lossless', 'Lossless', 'dl-btn-green');
         const atmosBtn = createButtons(url, details, false, 'atmos', 'Atmos', 'dl-btn-red');
-
+        
         hiresBtn.classList.add('header-btn-hires');
         losslessBtn.classList.add('header-btn-lossless');
         atmosBtn.classList.add('header-btn-atmos');
