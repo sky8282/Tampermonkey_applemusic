@@ -1577,6 +1577,18 @@
         }
         if (metaObj.isrc) atoms.push(buildMp4FreeformAtom('ISRC', metaObj.isrc));
         if (metaObj.upc) atoms.push(buildMp4FreeformAtom('UPC', metaObj.upc));
+        if (metaObj.rtng) {
+            atoms.push(buildAtom('rtng', new Uint8Array([metaObj.rtng]), 21));
+        }
+        if (metaObj.explicit) {
+            atoms.push(buildMp4FreeformAtom('isExplicit', 'true'));
+            atoms.push(buildMp4FreeformAtom('explicit', 'true'));
+            atoms.push(buildMp4FreeformAtom('parentalWarning', 'true'));
+            atoms.push(buildMp4FreeformAtom('rtng', '1'));
+            if (metaObj.explicitStatus) {
+                atoms.push(buildMp4FreeformAtom('explicitStatus', metaObj.explicitStatus));
+            }
+        }
 
         if (atoms.length === 0) {
             return buffer;
@@ -1916,6 +1928,14 @@
                 durationInMillis: durMs
             };
 
+            if (trackData.contentRating === 'explicit') {
+                metaObj.isExplicit = true;
+                metaObj.explicit = true;
+                metaObj.parentalWarning = true;
+                metaObj.rtng = 1;
+                metaObj.explicitStatus = "e";
+            }
+
             if (!isVideo) {
                 metaObj.coverUrl = trackData.coverUrl || item.coverUrl;
                 metaObj.picture = trackData.coverUrl || item.coverUrl;
@@ -2040,7 +2060,7 @@
             showStatusToast({ name: itemTitle, completedTracks: 0, totalTracks: 1 });
 
             try {
-                updateToastProgress({ status: 'running', trackName: '正在解析作品信息...', percent: 0, speed: '0.00 MB/s' });
+                updateToastProgress({ status: 'running', trackName: '正在解析...', percent: 0, speed: '0.00 MB/s' });
                 const fullItem = await getAlbumDetails(itemObj, true, 0, false);
                 const albumTitle = fullItem.name || itemTitle;
 
@@ -2151,28 +2171,10 @@
 
                 updateToastProgress({ status: 'running', albumName: albumTitle, completedTracks: 0, totalTracks: tracks.length });
 
-                const isSingleRelease = tracks.length === 1 || fullItem.type === 'song';
-                if (fullItem.coverUrl && !isSingleRelease) {
-                    try {
-                        updateToastProgress({ status: 'running', trackName: '正在保存专辑封面...' });
-                        const rootDirHandle = await getDirectoryHandle();
-                        const artistName = String(fullItem.artist || '未知歌手').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().replace(/[\s._]+$/g, '') || '未知歌手';
-                        const albumName = String(fullItem.name || '未知专辑').replace(/[\\/:*?"<>|\r\n]+/g, '_').trim().replace(/[\s._]+$/g, '') || '未知专辑';
-                        const artistDirHandle = await rootDirHandle.getDirectoryHandle(artistName, { create: true });
-                        const albumDirHandle = await artistDirHandle.getDirectoryHandle(albumName, { create: true });
-
-                        const coverBuf = await fetchCoverBuffer(fullItem.coverUrl);
-                        if (coverBuf) {
-                            const coverHandle = await albumDirHandle.getFileHandle('cover.jpg', { create: true });
-                            const coverWritable = await coverHandle.createWritable();
-                            await coverWritable.write(coverBuf);
-                            await coverWritable.close();
-                        }
-                    } catch (e) {
-                        console.warn('保存封面失败:', e);
-                    }
-                } else if (fullItem.coverUrl) {
-                    fetchCoverBuffer(fullItem.coverUrl);
+                if (fullItem.coverUrl) {
+                    fetchCoverBuffer(fullItem.coverUrl).catch(function(e) {
+                        console.warn('预加载封面失败:', e);
+                    });
                 }
 
                 await ensureAmDecryptLoaded();
@@ -2263,7 +2265,8 @@
                             completedTracks: successCount,
                             totalTracks: tracks.length,
                             trackName: trackTitle,
-                            percent: 0
+                            percent: '解析 m3u8 中...',
+                            speed: ''
                         });
 
                         try {
@@ -2272,7 +2275,7 @@
                             const dlUrl = prep.dlUrl;
                             const preloadedTrack = prep.preloadedTrack;
                             if (!dlUrl) {
-                                console.warn('跳过无流地址曲目:', trackTitle);
+                                console.warn('跳过无效 m3u8 曲目:', trackTitle);
                                 continue;
                             }
 
@@ -2281,6 +2284,13 @@
                                     prepareTrackAt(i + 1);
                                 }
                             };
+
+                            updateToastProgress({
+                                status: 'running',
+                                trackName: trackTitle,
+                                percent: '从解密服务器获取密钥中，请等待...',
+                                speed: '0.00 MB/s'
+                            });
 
                             await downloadSingleTrackInternal(fullItem, heavyTrack, trackTitle, dlUrl, preloadedTrack, triggerNextPreload);
                             if (!isDownloadCancelled) {
@@ -2319,6 +2329,9 @@
                     percent: 100,
                     speed: '已完成'
                 });
+
+                cachedCoverUrl = '';
+                cachedCoverPromise = null;
             } catch (error) {
                 console.error('下载出错:', error);
                 updateToastProgress({ status: 'error', error: error.message || String(error) });
