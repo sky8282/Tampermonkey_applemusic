@@ -10,7 +10,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @grant        unsafeWindow
-// @connect      t.kimu.edu.kg
+// @connect      apple.kimu.edu.kg
 // @connect      apple.com
 // @connect      itunes.apple.com
 // @connect      mzstatic.com
@@ -22,7 +22,7 @@
 (function() {
     'use strict';
 
-    const SERVER_URL = 'https://t.kimu.edu.kg';
+    const SERVER_URL = 'https://apple.kimu.edu.kg';
     
     const END_CHAR = String.fromCharCode(36);
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
